@@ -36,6 +36,7 @@ x-qwen: &qwen
       required: false
   environment:
     HOME: /cache
+    MODEL: /app/models/leminkozey-Qwen3.8-27B-Uncensored-W4A16-AutoRound
   volumes:
     - ${MODELS_DIR:-./models}:/app/models
     - qwen-cache:/cache
@@ -54,7 +55,7 @@ x-serve: &serve
           - driver: nvidia
             count: 1
             capabilities: [gpu]
-  restart: unless-stopped
+  restart: "no"
   stop_grace_period: 30s
   healthcheck:
     test: ["CMD", "curl", "-sf", "http://127.0.0.1:${PORT:-18020}/health"]
