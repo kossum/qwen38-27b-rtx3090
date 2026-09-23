@@ -19,6 +19,7 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 
 | patch | kind | what | upstream | cut against | retires when |
 |---|---|---|---|---|---|
+| bench-probe-errors | fix | `vllm bench serve`'s /tokenize alignment probe sends the API key (Bearer from OPENAI_API_KEY, --header wins) and classifies its failure (404 route-or-name vs 401 vs unreachable vs timeout) instead of one "endpoint unavailable" line for every cause; the /metrics scrapes (`fetch_spec_decode_metrics`, `fetch_diffusion_metrics`) send the benchmark's headers too, so a keyed server no longer reports the spec-decode block as absent | vllm #58024 | 0.28.0 | upstream PR |
 | dflash2-backport | backport, RETIRED | DFlash2 speculator on 0.27.1 | vllm #52816 (in 0.28.0) | 0.27.1 | done; kept for history, skipped by the Dockerfile |
 | dflash2-lookup-drafting | feature | lookup-augmented drafting for DFlash2 (n-gram search over the context); registers its `VLLM_DFLASH2_LOOKUP*`, `VLLM_DFLASH2_GRAPH_BOTH`, `VLLM_DFLASH2_DRAFT_TOPK_TOPP` knobs | none | 0.28.0 | upstreamed |
 | dflash2-ngram-chains | feature | quantized candidate chains for the drafter; `propose` override; registers `VLLM_DFLASH2_CHAIN*` | none | 0.28.0 | upstreamed |
@@ -34,6 +35,7 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 | mamba-align-checkpoint-order | fix | keep reachable Mamba state snapshots alive until request end (fork #52); registers `VLLM_MAMBA_ALIGN_KEEP_CHECKPOINTS` | vllm #45238 (not merged) | 0.28.0 | check against upstream #52789 (internal prefill checkpoints, in 0.29) at each pin |
 | mamba-align-retire-null-gaps | backport | align mode retires Mamba state blocks across null gaps instead of stopping at the first one (fork #101) | vllm #55450 (merged 2026-09-11) | 0.28.0 | the pin that carries #55450 |
 | mamba-chunked-prefill-align | fix | state loss and NaN during chunked prefill on Mamba/GDN | none yet | 0.28.0 | upstream PR |
+| marlin-int8-asym-zp | fix | the Marlin int8-activation path (`INT8_ACT=int8`) accepts zero-point `uint4` weights, so asymmetric AWQ exports (compressed-tensors `symmetric: false`) run W4A8 like the symmetric ones; the `kS8 x kU4` kernel is already compiled, only two asserts refused it | none yet | 0.28.0 (the same hunks apply to 0.29.0 at an offset) | upstream PR |
 | marlin-int8-layer-select | local | env vars to pick which layers run W4A8 with the Marlin kernel; registers and reads `VLLM_MARLIN_INT8_INCLUDE_RE` / `_EXCLUDE_RE` | none | 0.28.0 | stays |
 | marlin-int8-negative-scales | fix | Marlin W4A8 reads group scales as unsigned; AutoRound exports negative ones | none yet | 0.28.0 | upstream PR |
 | marlin-repack-staged-sm80 | local | one grow-only staging buffer for the sm80 Marlin repack (fork #27); registers `VLLM_MARLIN_REPACK_STAGED` | none | 0.28.0 | stays |
@@ -45,6 +47,8 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 | qwen3_5-embed-quant | fix | pass `quant_config` to the token embedding (main model and MTP module) | none yet | 0.28.0 | upstream PR |
 | qwen3_5-mtp-draft-vocab | feature | vocab-truncated draft head for MTP | none | 0.28.0 | upstreamed |
 | sampler-small-topk-fast-softmax | feature | sort-free top-k/top-p for small k, multi-block row softmax; registers `VLLM_DRAFT_TOPK_TOPP` and `VLLM_DRAFT_TEMP_SCALE` (both read once at import) | none | 0.28.0 | upstreamed or superseded |
+| serve-404-served-names | fix | the model-not-found 404 lists the served names (`Served models: ...`) so a misnamed model is a one-read response body | vllm #58025 | 0.28.0 | upstream PR |
+| serve-model-path-match | fix | a model name equal to a served model's root path or its basename is accepted (exact matches only): /v1/models publishes the root, and echoing it back used to 404 | vllm #58026 | 0.28.0 | upstream PR |
 | spec-decode-attn | feature | split-KV verify attention on FLASH_ATTN with query-row tiling; registers `VLLM_SPEC_DECODE_ATTN`, `VLLM_SPEC_DECODE_ATTN_QMAX`, `VLLM_SPEC_ATTN_BLOCK_M` (#114) | none | 0.28.0 | upstreamed |
 | spec-decode-int4-kv-mq3d | feature | multi-query 3D int4 verify path | none | 0.28.0 | rides with int4-kv-per-token-head |
 | spec-decode-int8-kv | feature | split-KV verify attention over an int8 per-token-head cache | none | 0.28.0 | rides with spec-decode-attn |
@@ -53,6 +57,7 @@ build by name instead of landing by guess. Regenerate a file with `bash scripts/
 | spec-sampler-prewarm | fix | compile the rejection sampler's Triton kernels at boot (fork #48) | none yet | 0.28.0 | upstream PR |
 | speed-knobs-envs | local | registers `VLLM_MARLIN_TUNE` and `VLLM_MARLIN_TUNE_DIR` for marlin-tune-table (the other knobs it used to register now live in the patches that read them) | none | 0.28.0 | stays while marlin-tune-table does |
 | sse-keep-alive | backport | SSE keep-alive comments on idle streaming responses so a proxy's idle timer does not drop a long prefill (#85, #115) | vllm #51034 | 0.28.0 | the pin that carries #51034 |
+| tokenize-v1-route | feature | /tokenize and /detokenize also served under /v1 for OpenAI-SDK base_urls; operation ids stay unique (name+path+method) | vllm #58027 | 0.28.0 | upstream PR |
 | triton-spec-attn-fp8-kv | feature | split-KV verify attention on the per-tensor fp8 KV cache (TRITON_ATTN, sm89+); registers `VLLM_SPEC_ATTN_DEBUG` (#90) | none | 0.28.0 | upstreamed |
 | vision-tower-cpu-offload | local | Qwen3 vision tower bulk weights in host RAM; registers `VLLM_VISION_CPU_OFFLOAD_GB` | none | 0.28.0 | stays |
 | vllm-pr50021-gdn-spec-bounds | backport | bounds checks in GDN/KDA spec-decode state lookups | vllm #50021 (open) | 0.28.0 | the pin that carries #50021 |
