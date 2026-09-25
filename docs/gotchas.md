@@ -216,13 +216,13 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     padded to `num_speculative_tokens` and a worker asking for fewer is ignored, silently.
     Adaptive block length (`LOOKUP=1` with `DFLASH_TOKENS > 7`) needs `ASYNC_SCHED=0`; at
     batch 1 that costs under 1%.
-    Still true on 0.28.0, and worth knowing *why*, because 0.28 looks like it
+    Still true on 0.29.0, and worth knowing *why*, because 0.29 looks like it
     handles this for you and does not: `VllmConfig` disables async scheduling
     automatically for speculative methods outside an allowlist, but that
     allowlist is `EagleModelTypes`, and `DFlashModelTypes` is inside it
-    (`config/speculative.py:66`). So dflash keeps async scheduling on unless
+    (`config/speculative.py:69` on 0.29.0, `:67` on 0.28.0). So dflash keeps async scheduling on unless
     something turns it off, and the launcher is that something.
-19. **`--async-scheduling` is already the default in 0.28.0.** The flag exists and passing it
+19. **`--async-scheduling` is already the default in 0.28.0 and 0.29.0.** The flag exists and passing it
     changes nothing; `--no-async-scheduling` is what turns it off. Two hours of "the adaptive
     block isn't working" was this.
 20. **The DFlash draft pass is a captured CUDA graph, so its Python runs once.**
@@ -651,7 +651,7 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     stored hits under `SPEC=mtp` and the cached count on a replay lands on the
     same block formula as the GPU path, one 832-token block more than before.
     **Sizing the tier, and why a default boot can show it doing nothing.**
-    Residency has no gauge in 0.28.0: both `kv_offload_cpu_cache_usage_perc`
+    Residency has no gauge in 0.28.0 or 0.29.0: both `kv_offload_cpu_cache_usage_perc`
     and its read twin count in-flight transfer pins (`num_used = allocated -
     free - evictable`, and `complete_store()` marks a block evictable the
     moment it lands), so a full tier reads 0.0 between transfers and a 0%
@@ -1365,3 +1365,26 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     is set explicitly, under a boot line ("defaulting prefix_cache_retention_interval
     to dense checkpointing") that reads like a managed setting and is the arm that
     fails ([#174](https://github.com/syv-ai/HyperQwen/issues/174)).
+    **What the sparse interval costs, so you can turn it the right way.** It also
+    sets hit granularity: a new conversation's first one or two follow-up turns
+    reuse only down to the last retained snapshot, and a conversation shorter than
+    one interval reuses nothing on those turns. After that all settings are
+    the same. Reference 3090, vLLM 0.29, 7 drafts (block 2176), one
+    conversation and no other traffic unless stated, cached tokens per turn:
+
+    | workload | dense | `PREFIX_RETENTION=4352` (2 blocks) | 13056 (default) |
+    |---|---|---|---|
+    | ~8K chat, turns 2-3 | 81% (1.7 s) | 54% (3.6 s) | **0%** (7.3 s) |
+    | ~8K chat, turn 4 on | ~98% | ~98% | ~98% |
+    | ~20K chat, turn 2 | 98% (0.8 s) | 87% (3.0 s) | 65% (7.2 s) |
+    | ~20K chat, turn 3 on | 99% | 99% | 99% |
+    | two ~32.6K chats alternating | **0%** (31.8 s) | 93% (2.7 s) | 93-99.5% |
+
+    So the default trades a few seconds on each new conversation's early turns for
+    never losing a long one outright. The knob runs one way: a **smaller** interval
+    (`PREFIX_RETENTION`, any multiple of the block) gives finer early hits and
+    less capacity before two long conversations collide; a **larger** one the
+    reverse. Two blocks already halves the early-turn cost and still held the
+    ~32.6K pair; where its collision knee sits is not measured, so a workload of
+    many short-to-medium chats is the one to try it on, and one that keeps two
+    or more long documents live should stay on the default.
