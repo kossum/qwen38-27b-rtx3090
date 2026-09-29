@@ -38,15 +38,22 @@ nothing in `docker-compose.yml` needs editing:
 
 ```
 GPU_COUNT=2
-EXTRA_ARGS="--tensor-parallel-size 2 --language-model-only"
+EXTRA_ARGS="--tensor-parallel-size 2"
 ```
+
+(The launchers already pass `--language-model-only` unless `VISION=1`, so it does not
+belong in `EXTRA_ARGS`; an earlier version of this example repeated it.)
 
 `GPU_COUNT` defaults to 1, which is *the first card the runtime enumerates* —
 GPU 0, not necessarily the card you meant. On a mixed box, expose them all and
 pin inside the container with `GPU_COUNT=all` plus `CUDA_VISIBLE_DEVICES=1,2`
 (the device reservation decides what is visible, so `NVIDIA_VISIBLE_DEVICES`
 in `.env` alone was not enough; `CUDA_VISIBLE_DEVICES` is read inside the
-container and is what gotcha 53 recommends).
+container and is what gotcha 53 recommends). Set `CUDA_DEVICE_ORDER=PCI_BUS_ID`
+as well: by default CUDA numbers the fastest card first, so on a box that mixes
+generations `CUDA_VISIBLE_DEVICES=0,1` can name a different pair than `nvidia-smi`
+shows. That happens on native Linux too, not only under WSL2: a 5080 was paired
+with a 3080 that way in [#216](https://github.com/syv-ai/HyperQwen/issues/216).
 
 **Pin the KV pool before you measure anything, or before you trim `MAX_LEN`
 until the OOMs stop.** Under `--tensor-parallel-size > 1` the launcher
@@ -191,7 +198,9 @@ loss there (113.7 -> 127.0), and `NCCL_SHM_USE_CUDA_MEMCPY=1` hung after
 compile. Pipeline parallelism is not an option with this checkpoint: vLLM
 refuses `--pipeline-parallel-size` because the multimodal
 `Qwen3_5ForConditionalGeneration` class does not declare `SupportsPP`, even
-with `--language-model-only`. The same box's native-Linux numbers are not
+with `--language-model-only`. (One later report did boot PP=2 on vLLM 0.28;
+see [Pipeline parallelism](#pipeline-parallelism-one-report-160) below.)
+The same box's native-Linux numbers are not
 measured, so part of the TP=2 loss may be WSL2's.
 
 Also reported working: **2× RTX 5060 Ti 16 GB**
@@ -216,20 +225,72 @@ greedy decode:
 |---|---|---|---|
 | TP2 | 71.4 | 102.0 | 1.43x |
 | TP4 | 72.8 | 137.6 | 1.89x |
+| TP2, 2x RTX 3090 (sm86, uncapped, [#217](https://github.com/syv-ai/HyperQwen/issues/217)) | 90.9 | 156.0 | 1.72x |
 
-`tok/step` is ~2.7 in all four cells, so this is step time, not acceptance —
+`tok/step` is 2.5-2.7 in every cell, so this is step time, not acceptance —
 and the fp8/FlashInfer path does not scale with TP at all while the int8 path
 does. The KV pool costs ~5-9% for it. This inverts the single-card picture,
 where int8 on `TRITON_ATTN` is a long-context capacity trade that costs ~25% of
-decode at depth (`docs/gotchas.md` 40), so it is not a launcher default: it is
-one box, one card generation, and nobody has run the arm on Ampere at TP>1.
+decode at depth (`docs/gotchas.md` 40), so it is not a launcher default yet. The
+third row is the Ampere answer: two 3090s at TP=2 (peer-to-peer from a patched
+driver, no NVLink) show the same shape, 2.53 against 2.57 `tok/step` at the
+default temperature and roughly 31 against 18 ms per step.
 It is at least not a correctness trap on Ampere: at TP1 on the reference 3090
 (vLLM 0.29, async scheduling on) it passes the concurrent-garbage check from
 [#121](https://github.com/syv-ai/HyperQwen/issues/121) — three concurrent
 ~48K prompts three times over, then three alone, 9/9 and 3/3 valid, same as
 the fp8/FlashInfer control.
-If you have a dual-3090 box, that is the most useful A/B left in this file:
+The arm, for anyone who wants to check it on their own cards:
 
 ```
 SPEC=mtp CTX=long EXTRA_ARGS="--tensor-parallel-size 2 --attention-backend TRITON_ATTN --kv-cache-dtype int8_per_token_head"
 ```
+
+## Pipeline parallelism (one report, #160)
+
+Nothing in the repo sets `--pipeline-parallel-size`, and no profile is tested
+with it. One field report ([#160](https://github.com/syv-ai/HyperQwen/issues/160))
+measured it on vLLM 0.28.0, and it is worth knowing before you try: **PP=2 with
+`SPEC=off` works well, and PP=2 with MTP is a net loss.** It has not been re-run
+on 0.29 or 0.30, and it is one box.
+
+Hardware: an RTX 3090 24 GB and an RTX A4000 16 GB, PCIe, no peer-to-peer.
+Serving: `--pipeline-parallel-size 2 --distributed-executor-backend mp`,
+`VLLM_PP_LAYER_PARTITION=48,16` (48 layers on the 3090, 16 on the A4000),
+`--attention-backend TRITON_ATTN --kv-cache-dtype int4_per_token_head`,
+`MAX_LEN=262144`, a RedHatAI int4 checkpoint with the head requantized to int8.
+Greedy, 256-token generations, median of three:
+
+| configuration | single stream | 2 streams | 4 streams | MTP acceptance | KV pool |
+|---|---|---|---|---|---|
+| TP=2 + MTP (baseline) | 75.6 tok/s | 132.7 | | 45.6% | 581,403 |
+| PP=2 + MTP | 19.7-19.8 | 48.6 | 72.3 | **7.5-8.4%** | 726K-792K |
+| PP=2 + `SPEC=off` | 32.9 | 61.4 | 55.6 | | 778,942 |
+| PP=2 + async + `SPEC=off` | 36.9 | 68.8 | **134.2** | | **844,852** |
+
+- **PP=2 + MTP.** It only boots with a local patch: upstream's
+  `_pp_broadcast_prev_sampled_token_ids` asserts one sampled token per request,
+  which speculation breaks. With the patch, acceptance falls from 45.6% to about
+  8% at every `MAX_SEQS` (2, 3 and 4), and single-stream decode is 40% *slower*
+  than PP=2 with no drafter (19.8 against 32.9): the drafter's four chained
+  forwards and the 5-token verify are paid for almost nothing.
+- **PP=2 + async scheduling + MTP** printed degenerated repetition from the first
+  token. The maintainer's read of vLLM 0.28.0: `Qwen3_5MTP` does not declare
+  `SupportsPP` (four other MTP models in that release do), and under
+  speculation a request accepts 1 to k+1 tokens per step, so the one-column
+  broadcast hands the first pipeline stage the wrong prefix. That is a gap in
+  vLLM's contract that a local patch cannot close; the reporter filed it
+  upstream as [vllm-project/vllm#57755](https://github.com/vllm-project/vllm/issues/57755).
+- **PP=2 + `SPEC=off`** is healthy: a 246K needle passes, the KV pool is
+  778,942 to 844,852 tokens (2.97x to 3.22x concurrency at 262k) against
+  581,403 (2.22x) at TP=2, a 32K prefill takes 15.9 s against 23.7 s at TP=2,
+  and async scheduling with four slots reaches 134 tok/s aggregate.
+
+If you have two unequal cards and want the pool more than single-stream decode
+speed, `SPEC=off` is the combination to try (the fastest row above ran with
+async scheduling on). Do not combine PP with `SPEC=mtp`. The reporter's
+TP=2 baseline was not confirmed to run at the same `MAX_LEN` and `MAX_SEQS` as
+the PP rows, and the two cards had different power limits (an A4000 is a 140 W
+part), which matters little for a PP comparison because the ranks run in turn.
+The earlier note above that vLLM refuses PP for this checkpoint's multimodal
+class was written for a different setup; the two are not reconciled here.

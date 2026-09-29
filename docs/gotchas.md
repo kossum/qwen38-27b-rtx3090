@@ -618,6 +618,12 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     independent Xid-31 trigger. Not shipped here (no sm80 to regression-test
     against); recorded so the next GA100/A100 report starts from the answer
     instead of from five reboots.
+    **On a GA100 mining card such as the CMP 170HX, set `VLLM_MARLIN_REPACK_STAGED=1`**
+    (opt-in since 2026-09-28). `marlin-repack-staged-sm80` stages the repack's
+    per-layer transients through one grow-only GPU buffer; on the 170HX that took the
+    repack window from the CPU fallback's 403.7 s to 44.9 s, bit-exact (the patch
+    header has the A/B). It is off by default everywhere because on a real A100 40 GB,
+    against the stock GPU repack, it saves 0.85 s of load and holds 1.19 GiB of pool.
 38. **The OffloadingConnector's CPU tier can be silently useless: uniform
     blocks meet asymmetric chunk sizes, and one request evicts everything
     (issue #33).** The tier allocates equal-size blocks sized for the LARGEST
@@ -1394,3 +1400,34 @@ Things that each cost us hours, in rough order of pain. Worth skimming before yo
     32K each, 12 blocks (24576) read 130.6 tok/s and 92% cached against 6
     blocks' (12288) 116.4 and 90%, and dense read 55.0 and 67%. So under heavy
     concurrency of long prompts, a coarser interval than the default can pay.
+    On 0.30, 0.29's forcing to dense is gone (vllm #55760 went to the 0.29 release
+    branch only), and an unset interval means 0: the replay boundaries only. That does not zero
+    reuse, but each turn's hit now ends inside the previous prompt, two blocks (864
+    tokens at the MTP block) before 0.29's, which reached a few hundred tokens
+    into the reply, so a turn prefills those again. So both single-user launchers now pass the
+    interval on every draft profile: the measured one above, else `None` (dense,
+    0.29's behaviour). `PREFIX_RETENTION=0` asks for boundaries only
+    ([vllm-0.30.md](vllm-0.30.md) has the measurement). `alternative.sh` keys its
+    default on a KV tier, so `None` in one boot log and `0` in another is the tier:
+    without one it passes `0`, because at dense two ~60K conversations on its int4
+    pool evicted each other completely (0 / 0 cached, where `0` held 93.5% for both);
+    with `--kv-offloading-size` it passes `None`, which the tier serves from (96-98%
+    on 0.30, where beside `0` a tier served nothing on 0.29).
+61. **The shipped MTP draft vocabulary is English, Danish and code. On Chinese
+    output it covers about 6% of tokens, and `SPEC=mtp` collapses to ~1.06
+    tokens per step.** The 40,960-id list (`prepare/draft_vocab_ids.json`, and
+    `mtp_draft_vocab_ids.pt` in every checkpoint built from it) was counted over
+    Danish web text, English Wikipedia, Python and the model's own outputs, and
+    a token outside it can never be drafted, so it is a certain rejection that
+    also ends the chain. Measured with the model's own tokenizer: the repo's
+    docs 96.4%, its Python 92.8%, its shell 93.4%, a Chinese prose sample 6.4%.
+    A 3090 serving mostly Chinese traffic read 1.06 mean acceptance and 35.5
+    tok/s, and 2.23 and 80.6 tok/s at `MTP_DRAFT_VOCAB=0`
+    ([#196](https://github.com/syv-ai/HyperQwen/issues/196)). So for any
+    language outside the list's corpus, start with `MTP_DRAFT_VOCAB=0` (the
+    full `lm_head`; exact either way). Or rebuild the list from your own
+    traffic with `prepare/build_draft_vocab.py --corpus`. That report's rebuilt
+    list (99.8% held-out coverage on its own corpus) reached 61-64 tok/s at
+    `CTX=long` k=3, still below the full head's 80.6 there. The truncated head's
+    win in the `CTX=fast` k=4 ladder has not been re-measured at `CTX=long`.
+    DFlash2 does not use this list.

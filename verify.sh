@@ -6,14 +6,33 @@
 #
 #   bash verify.sh            # everything
 #   bash verify.sh --no-server
+#   bash verify.sh --wait 300 # wait up to 300 s for /health before grading live
 #   bash verify.sh --install  # only the install (venv, vLLM, patches, KVarN): no GPU,
 #                             # model or server checks — what the Docker build runs
 # Exit code: 0 all PASS (WARNs allowed), 1 if anything FAILs.
+# --wait SECONDS (default 0 = check /health once, as before) polls
+# GET /health until 200 before grading the live section. Accepts --wait 300
+# or --wait=300. VERIFY_SERVER_PID (optional) aborts the wait early if that
+# pid dies, mirroring single-user/qwen-server.sh's server-death detection
+# (verify.sh owns no child, so the pid is opt-in rather than built in).
 # PY=/path/to/python overrides the interpreter (default: this repo's venv).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
-NOSRV=0; INSTALL=0
-for a in "$@"; do case "$a" in --no-server) NOSRV=1;; --install) INSTALL=1; NOSRV=1;; esac; done
+NOSRV=0; INSTALL=0; WAIT=0
+_WAIT_ARG=0
+for a in "$@"; do
+  if [ "$_WAIT_ARG" = 1 ]; then
+    case "$a" in ''|*[!0-9]*) echo "verify.sh: --wait needs a non-negative integer number of seconds (got '$a')" >&2; exit 2;; *) WAIT=$a;; esac
+    _WAIT_ARG=0; continue
+  fi
+  case "$a" in
+    --no-server) NOSRV=1;;
+    --install) INSTALL=1; NOSRV=1;;
+    --wait) _WAIT_ARG=1;;
+    --wait=*) _WAIT_VAL=${a#--wait=}; case "$_WAIT_VAL" in ''|*[!0-9]*) echo "verify.sh: --wait needs a non-negative integer number of seconds (got '$_WAIT_VAL')" >&2; exit 2;; *) WAIT=$_WAIT_VAL;; esac;;
+  esac
+done
+if [ "$_WAIT_ARG" = 1 ]; then echo "verify.sh: --wait needs a value: --wait SECONDS" >&2; exit 2; fi
 FAILS=0
 ok()   { printf "  PASS  %s\n" "$1"; }
 warn() { printf "  WARN  %s\n" "$1"; }
@@ -24,7 +43,7 @@ PY=${PY:-$HERE/venv/bin/python}
 echo "== environment"
 [ -x "$PY" ] && ok "python: $PY" || { fail "no $PY (see README Setup)"; exit 1; }
 VER=$($PY -c "import vllm; print(vllm.__version__)" 2>/dev/null | tail -n1)
-[ "$VER" = "0.29.0" ] && ok "vllm $VER" || warn "vllm ${VER:-missing} (patches were written against 0.29.0)"
+[ "$VER" = "0.30.0" ] && ok "vllm $VER" || warn "vllm ${VER:-missing} (patches were written against 0.30.0)"
 SP=$($PY -c "import vllm, os; print(os.path.dirname(vllm.__file__))" 2>/dev/null | tail -n1)
 [ -n "$SP" ] && [ -d "$SP" ] && ok "vllm package at $SP" || { fail "cannot import vllm with $PY"; exit 1; }
 if [ $INSTALL = 0 ]; then
@@ -95,12 +114,16 @@ $PY -c "import vllm.envs as e, sys; sys.exit(0 if 'VLLM_MARLIN_INT8_INCLUDE_RE' 
 
 echo "== KVarN (optional, kvarn/)"
 if [ -f "$SP/v1/attention/backends/kvarn_attn.py" ]; then
-  if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < kvarn/kvarn-0.29.0.patch >/dev/null 2>&1; then
+  if patch -p1 -R --dry-run -s --fuzz 0 -d "$SP" < kvarn/kvarn-0.30.0.patch >/dev/null 2>&1; then
     $PY -c "from vllm.v1.attention.backends.registry import AttentionBackendEnum; AttentionBackendEnum.KVARN.get_class()" 2>/dev/null && ok "KVarN backend importable, patch applied (KV=kvarn / CTX=huge available)" || fail "KVarN files present but backend does not import"
-  else fail "KVarN modules present but kvarn-0.29.0.patch not applied (bash kvarn/install.sh)"; fi
-  if $PY patches/_check_applied.py kvarn/kvarn-v2-runner-0.29.0.patch "$SP" >/dev/null 2>&1; then
-    ok "kvarn-v2-runner-0.29.0.patch applied (SPEC=dflash2 + CTX=huge available)"
-  else warn "kvarn-v2-runner-0.29.0.patch not applied (re-run bash kvarn/install.sh for DFlash2 at 240k)"; fi
+  else fail "KVarN modules present but kvarn-0.30.0.patch not applied (bash kvarn/install.sh)"; fi
+  if $PY patches/_check_applied.py kvarn/kvarn-v2-runner-0.30.0.patch "$SP" >/dev/null 2>&1; then
+    ok "kvarn-v2-runner-0.30.0.patch applied (SPEC=dflash2 + CTX=huge available)"
+  else warn "kvarn-v2-runner-0.30.0.patch not applied (re-run bash kvarn/install.sh for DFlash2 at 240k)"; fi
+  if $PY patches/_check_applied.py kvarn/kvarn-recycled-pages-0.30.0.patch "$SP" >/dev/null 2>&1 \
+      && grep -q "def note_scheduled_blocks" "$SP/v1/attention/backends/kvarn_attn.py"; then
+    ok "kvarn-recycled-pages-0.30.0.patch applied (no late KVarN flush into mamba state, #208)"
+  else warn "kvarn-recycled-pages-0.30.0.patch not applied: CTX=huge + PREFIX_CACHE=1 can print \"!!!!\" (#208; bash kvarn/install.sh)"; fi
 else warn "KVarN not installed (optional; bash kvarn/install.sh for 262k context)"; fi
 
 if [ $INSTALL = 0 ]; then
@@ -317,6 +340,21 @@ fi  # INSTALL
 if [ $NOSRV = 0 ]; then
   echo "== live server (127.0.0.1:${PORT:-18020})"
   PORT=${PORT:-18020}
+  if [ "$WAIT" -gt 0 ]; then
+    # Bounded poll for /health, same shape as single-user/qwen-server.sh:
+    # fixed 5 s interval, at most WAIT seconds, abort if the server pid dies.
+    echo "verify: waiting up to ${WAIT}s for http://127.0.0.1:$PORT/health ..."
+    _WAIT_N=$(( (WAIT + 4) / 5 )); _WAIT_HIT=0
+    for _w in $(seq 1 "$_WAIT_N"); do
+      if [ -n "${VERIFY_SERVER_PID:-}" ] && ! kill -0 "$VERIFY_SERVER_PID" 2>/dev/null; then
+        echo "verify: server process $VERIFY_SERVER_PID exited before becoming healthy" >&2
+        break
+      fi
+      if curl -sf -o /dev/null "http://127.0.0.1:$PORT/health"; then _WAIT_HIT=1; break; fi
+      sleep 5
+    done
+    [ "$_WAIT_HIT" = 1 ] && echo "verify: /health 200 after waiting"
+  fi
   if curl -sf -o /dev/null http://127.0.0.1:$PORT/health; then
     ok "/health 200"
     KEY=${VLLM_API_KEY:-$(cat api_key.txt 2>/dev/null)}
